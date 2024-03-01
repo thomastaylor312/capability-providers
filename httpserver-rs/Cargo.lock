@@ -3250,7 +3250,7 @@ dependencies = [
 
 [[package]]
 name = "wasmcloud-provider-httpserver"
-version = "0.19.1"
+version = "0.19.1-taylor"
 dependencies = [
  "assert_matches",
  "async-trait",
@@ -3262,6 +3262,7 @@ dependencies = [
  "flume",
  "futures",
  "http",
+ "hyper",
  "opentelemetry 0.18.0",
  "reqwest",
  "serde",

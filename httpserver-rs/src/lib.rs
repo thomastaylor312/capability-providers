@@ -40,8 +40,10 @@ use std::{
 
 use bytes::Bytes;
 use flume::{bounded, Receiver, Sender};
-use futures::Future;
-use http::header::HeaderMap;
+use futures::{Future, FutureExt};
+use http::{header::HeaderMap, StatusCode};
+use hyper::service::{make_service_fn, service_fn};
+use hyper::{Body, Method, Request, Response, Server};
 use thiserror::Error as ThisError;
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, trace, Instrument};
@@ -164,103 +166,23 @@ impl HttpServerCore {
     ///    let server = HttpServer::new(settings);
     ///    let _ = server.start().await?;
     /// ```
-    pub async fn start(&self, ld: &LinkDefinition) -> Result<JoinHandle<()>, Error> {
-        let timeout = self
-            .inner
-            .settings
-            .timeout_ms
-            .map(std::time::Duration::from_millis);
-
+    pub async fn start(
+        &self,
+        ld: &LinkDefinition,
+    ) -> Result<JoinHandle<Result<(), hyper::Error>>, Error> {
         let ld = Arc::new(ld.clone());
-        let linkdefs = ld.clone();
-        let trace_ld = ld.clone();
-        let arc_inner = self.inner.clone();
-        let route = warp::any()
-            .and(warp::header::headers_cloned())
-            .and(warp::method())
-            .and(warp::body::bytes())
-            .and(warp::path::full())
-            .and(opt_raw_query())
-            .and_then(
-                move |
-                      headers: HeaderMap,
-                      method: http::method::Method,
-                      body: Bytes,
-                      path: FullPath,
-                      query: String| {
-                    let span = tracing::debug_span!("http request", %method, path = %path.as_str(), %query);
-                    let ld = linkdefs.clone();
-                    let arc_inner = arc_inner.clone();
-                    async move{
-                        if let Some(readonly_mode) = arc_inner.settings.readonly_mode{
-                            if readonly_mode && method!= http::method::Method::GET && method!= http::method::Method::HEAD {
-                                debug!("Cannot use other methods in Read Only Mode");
-                                // If this fails it is developer error, so unwrap is okay
-                                let resp = http::Response::builder().status(http::StatusCode::METHOD_NOT_ALLOWED).body(Vec::with_capacity(0)).unwrap();
-                                return Ok::<_, warp::Rejection>(resp)
-                            }
-                        }
-                        let hmap = convert_request_headers(&headers);
-                        let req = HttpRequest {
-                            body: Vec::from(body),
-                            header: hmap,
-                            method: method.as_str().to_ascii_uppercase(),
-                            path: path.as_str().to_string(),
-                            query_string: query,
-                        };
-                        trace!(
-                            ?req,
-                            "httpserver calling actor"
-                        );
-                        let response = match arc_inner.call_actor.call(arc_inner.lattice_id.clone(), ld.clone(), req, timeout).in_current_span().await {
-                            Ok(resp) => resp,
-                            Err(e) => {
-                                error!(
-                                    error = %e,
-                                    "Error sending HttpRequest to actor"
-                                );
-                                HttpResponse {
-                                    status_code: http::StatusCode::INTERNAL_SERVER_ERROR.as_u16(),
-                                    body: Default::default(),
-                                    header: Default::default(),
-                                }
-                            }
-                        };
-                        let status = match http::StatusCode::from_u16(response.status_code) {
-                            Ok(status_code) => status_code,
-                            Err(e) => {
-                                error!(
-                                    status_code = %response.status_code,
-                                    error = %e,
-                                    "invalid response status code, changing to 500"
-                                );
-                                http::StatusCode::INTERNAL_SERVER_ERROR
-                            }
-                        };
-                        let http_builder = http::Response::builder()
-                        .status(status);
-                        let http_builder = if let Some(cache_control_header) = arc_inner.settings.cache_control.as_ref(){
-                            let mut builder = http_builder;
-                            builder = builder.header("Cache-Control",cache_control_header);
-                            builder
-                        }else{
-                            http_builder
-                        };
-                        // Unwrapping here because validation takes place for the linkdef
-                        let mut http_response = http_builder.body(response.body).unwrap();
-                        convert_response_headers(response.header, http_response.headers_mut());
-                        Ok::<_, warp::Rejection>(http_response)
-                    }.instrument(span)
-                },
-            ).with(warp::trace(move |req_info| {
-                let actor_id = &trace_ld.actor_id;
-                let span = tracing::debug_span!("request", method = %req_info.method(), path = %req_info.path(), query = tracing::field::Empty, %actor_id);
-                if let Some(remote_addr) = req_info.remote_addr() {
-                    span.record("remote_addr", &tracing::field::display(remote_addr));
-                }
+        let ld_clone = ld.clone();
+        let inner = self.inner.clone();
 
-                span
-            }));
+        let make_svc = make_service_fn(move |_conn| {
+            let inner_clone = inner.clone();
+            let ld = ld_clone.clone();
+            async move {
+                Ok::<_, Infallible>(service_fn(move |req| {
+                    handle_request(req, inner_clone.clone(), ld.clone())
+                }))
+            }
+        });
 
         let addr = self.settings.address.unwrap();
         info!(
@@ -269,45 +191,83 @@ impl HttpServerCore {
             "httpserver starting listener for actor",
         );
 
-        // add Cors configuration, if enabled, and spawn either TlsServer or Server
-        let cors = cors_filter(&self.settings)?;
-        let server = warp::serve(route.with(cors));
-        let handle = tokio::runtime::Handle::current();
-        let shutdown_rx = self.shutdown_rx.clone();
-        let join = if self.settings.tls.is_set() {
-            let (_, fut) = server
-                .tls()
-                // unwrap ok here because tls.is_set confirmed both fields are some()
-                .key_path(self.settings.tls.priv_key_file.as_ref().unwrap())
-                .cert_path(self.settings.tls.cert_file.as_ref().unwrap())
-                // we'd prefer to use try_bind_with_graceful_shutdown but it's not supported
-                // for tls server yet. Waiting on https://github.com/seanmonstar/warp/pull/717
-                // attempt to bind to the address
-                .bind_with_graceful_shutdown(addr, async move {
-                    if let Err(e) = shutdown_rx.recv_async().await {
-                        error!(error = %e, "shutting down httpserver listener");
-                    }
-                });
-            handle.spawn(fut)
-        } else {
-            let (_, fut) = server
-                .try_bind_with_graceful_shutdown(addr, async move {
-                    if let Err(e) = shutdown_rx.recv_async().await {
-                        error!(error = %e, "shutting down httpserver listener");
-                    }
-                })
-                .map_err(|e| {
-                    Error::Settings(format!(
-                        "failed binding to address '{}' reason: {}",
-                        &addr.to_string(),
-                        e
-                    ))
-                })?;
-            handle.spawn(fut)
-        };
+        let server = Server::bind(&addr).serve(make_svc);
 
-        Ok(join)
+        let handle = tokio::runtime::Handle::current();
+
+        Ok(handle.spawn(server))
     }
+}
+
+async fn handle_request(
+    req: Request<Body>,
+    arc_inner: Arc<Inner>,
+    ld: Arc<LinkDefinition>,
+) -> Result<Response<Body>, Infallible> {
+    let timeout = arc_inner
+        .settings
+        .timeout_ms
+        .map(std::time::Duration::from_millis);
+    let method = req.method().clone();
+    let path = req.uri().path().to_owned();
+    let query = req.uri().query().unwrap_or_default().to_owned();
+    let headers = req.headers().clone();
+
+    // Read-only mode check
+    if let Some(readonly_mode) = arc_inner.settings.readonly_mode {
+        if readonly_mode && method != Method::GET && method != Method::HEAD {
+            let resp = Response::builder()
+                .status(StatusCode::METHOD_NOT_ALLOWED)
+                .body(Body::empty())
+                .unwrap();
+            return Ok(resp);
+        }
+    }
+
+    // Convert headers
+    let hmap = convert_request_headers(&headers);
+
+    // Read the body
+    let body_bytes = hyper::body::to_bytes(req.into_body())
+        .await
+        .unwrap_or_default();
+
+    // Construct the HttpRequest
+    let req = HttpRequest {
+        body: body_bytes.to_vec(),
+        header: hmap,
+        method: method.as_str().to_ascii_uppercase(),
+        path,
+        query_string: query,
+    };
+
+    // Call actor and get response
+    let response = match arc_inner
+        .call_actor
+        .call(arc_inner.lattice_id.clone(), ld.clone(), req, timeout)
+        .await
+    {
+        Ok(resp) => resp,
+        Err(e) => HttpResponse {
+            status_code: http::StatusCode::INTERNAL_SERVER_ERROR.as_u16(),
+            body: Default::default(),
+            header: Default::default(),
+        },
+    };
+
+    // Construct the hyper Response
+    let mut builder = Response::builder().status(response.status_code);
+
+    // Set cache control header if present
+    if let Some(cache_control_header) = arc_inner.settings.cache_control.as_ref() {
+        builder = builder.header("Cache-Control", cache_control_header);
+    }
+
+    // Convert response headers
+    let mut hyper_response = builder.body(Body::from(response.body)).unwrap();
+    convert_response_headers(response.header, hyper_response.headers_mut());
+
+    Ok(hyper_response)
 }
 
 impl Drop for HttpServerCore {
